@@ -20,6 +20,10 @@ use xdg::BaseDirectories;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+    #[arg(short, default_value_t = false, help = "force a new instance")]
+    force: bool,
+    #[arg(short, default_value_t = true, help = "automatically create a daemon")]
+    autostart: bool,
 }
 
 #[derive(Subcommand)]
@@ -39,10 +43,7 @@ enum Commands {
     /// Kills or executes a process, depending on if a process for that name already exists
     Toggle { name: String },
     /// Start a deamon
-    Daemon {
-        #[arg(short, default_value_t = false, help = "force a new instance")]
-        force: bool,
-    },
+    Daemon,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -290,12 +291,36 @@ fn main() {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Daemon { force: f } => {
-            let daemon = Daemon::new(*f);
+        Commands::Daemon => {
+            let daemon = Daemon::new(cli.force);
             daemon.run();
         }
-        _ => send_message(
-            Message::try_from(cli.command).expect("can convert all that is not Commands::Daemon"),
-        ),
+        _ => {
+            if cli.autostart && !PathBuf::from("/tmp/uniq-proc.sock").exists() {
+                println!(
+                    "{}",
+                    std::env::current_exe()
+                        .expect("can get own executable")
+                        .to_str()
+                        .expect("it owrks")
+                );
+                let mut cmd = std::process::Command::new(
+                    std::env::current_exe().expect("can get own executable"),
+                );
+                if cli.force {
+                    cmd.arg("-f");
+                }
+                cmd.arg("daemon");
+                cmd.spawn().expect("can start command");
+
+                while !PathBuf::from("/tmp/uniq-proc.sock").exists() {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+            send_message(
+                Message::try_from(cli.command)
+                    .expect("can convert all that is not Commands::Daemon"),
+            );
+        }
     }
 }
