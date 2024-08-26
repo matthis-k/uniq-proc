@@ -1,8 +1,13 @@
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
-use serde_json::{from_str, to_string_pretty};
+use serde_json::from_str;
+use signal_hook::consts::{SIGINT, SIGTERM};
+use signal_hook::iterator::Signals;
+use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::{collections::HashMap, fs, process::Command};
-use std::{fs::File, io::Write, path::PathBuf};
+use std::{io::Write, path::PathBuf};
 use sysinfo::{ProcessExt, System, SystemExt};
 use xdg::BaseDirectories;
 
@@ -23,6 +28,31 @@ enum Commands {
     Add { name: String, command: String },
     /// Removes a command
     Remove { name: String },
+    /// Lists all commands
+    List,
+    /// Executes a command
+    Execute { name: String },
+    /// Kills a process
+    Kill { name: String },
+    /// Kills and re-execute a process
+    Restart { name: String },
+    /// Kills or executes a process, depending on if a process for that name already exists
+    Toggle { name: String },
+    /// Start a deamon
+    Daemon {
+        #[arg(short, default_value_t = false, help = "force a new instance")]
+        force: bool,
+    },
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+enum Message {
+    /// Adds or overwrites a command
+    Add { name: String, command: String },
+    /// Removes a command
+    Remove { name: String },
+    /// Lists all commands
+    List,
     /// Executes a command
     Execute { name: String },
     /// Kills a process
@@ -33,115 +63,226 @@ enum Commands {
     Toggle { name: String },
 }
 
-#[derive(Serialize, Deserialize)]
-struct Config {
+impl TryFrom<Commands> for Message {
+    type Error = String;
+
+    fn try_from(value: Commands) -> Result<Self, Self::Error> {
+        match value {
+            Commands::Daemon { .. } => Err("Daemon is not a message".into()),
+            Commands::Add { name, command } => Ok(Message::Add { name, command }),
+            Commands::Remove { name } => Ok(Message::Remove { name }),
+            Commands::Execute { name } => Ok(Message::Execute { name }),
+            Commands::Kill { name } => Ok(Message::Kill { name }),
+            Commands::Restart { name } => Ok(Message::Restart { name }),
+            Commands::List => Ok(Message::List),
+            Commands::Toggle { name } => Ok(Message::Toggle { name }),
+        }
+    }
+}
+
+#[derive(Default)]
+struct Daemon {
+    data: Arc<Mutex<DaemonState>>,
+    force: bool,
+}
+
+impl Daemon {
+    pub fn new(force: bool) -> Self {
+        Self {
+            data: Arc::from(Mutex::from(DaemonState::new())),
+            force,
+        }
+    }
+
+    fn list(&self) -> String {
+        let data = self.data.lock().expect("working mutex");
+        serde_json::to_string(&data.commands).expect("can convert to json")
+    }
+}
+impl Daemon {
+    pub fn run(&self) {
+        if self.force {
+            let _ = std::fs::remove_file(SOCKET_PATH);
+        }
+        let running = Arc::from(AtomicBool::new(true));
+        let running_clone = running.clone();
+        const SOCKET_PATH: &str = "/tmp/uniq-proc.sock";
+        std::thread::spawn(move || {
+            let mut signals = Signals::new(&[SIGINT, SIGTERM]).unwrap();
+            for sig in signals.forever() {
+                match sig {
+                    _ => {
+                        running_clone.store(false, Ordering::SeqCst);
+                        break;
+                    }
+                }
+            }
+        });
+
+        let socket = std::os::unix::net::UnixListener::bind(SOCKET_PATH)
+            .expect("successfull creation of socket");
+        socket
+            .set_nonblocking(true)
+            .expect("can set socket to nnblocking");
+        std::thread::scope(|s| {
+            while running.load(std::sync::atomic::Ordering::SeqCst) {
+                let connection = socket.accept();
+                match connection {
+                    Ok((mut stream, _)) => {
+                        let mut msg_raw = String::new();
+                        use std::io::Read;
+                        let _ =
+                            stream.set_read_timeout(Some(std::time::Duration::from_millis(160)));
+                        let _ = stream.read_to_string(&mut msg_raw);
+                        let msg = from_str(&msg_raw);
+                        s.spawn(move || {
+                            let response = match msg {
+                                Ok(Message::Add { name, command }) => self.add(name, command),
+                                Ok(Message::Remove { name }) => self.remove(name),
+                                Ok(Message::Kill { name }) => self.kill(name),
+                                Ok(Message::Restart { name }) => self.restart(name),
+                                Ok(Message::Toggle { name }) => self.toggle(name),
+                                Ok(Message::Execute { name }) => self.execute(name),
+                                Ok(Message::List) => self.list(),
+                                Err(_) => String::from("Could parse the command"),
+                            };
+                            stream.write_all(&response.bytes().collect::<Vec<_>>())
+                        });
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(160)),
+                }
+            }
+        });
+        std::fs::remove_file(SOCKET_PATH).expect("can remove socket");
+    }
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct DaemonState {
     commands: HashMap<String, String>,
+    procs: HashMap<String, u32>,
 }
 
-#[derive(Serialize, Deserialize)]
-struct ProcessMap {
-    processes: HashMap<String, u32>,
-}
-
-fn get_config_path() -> PathBuf {
-    let base_dirs = BaseDirectories::with_prefix("uniq-proc").unwrap();
-    base_dirs.place_config_file("config.json").unwrap()
-}
-
-fn get_process_map_path() -> PathBuf {
-    PathBuf::from("/tmp/uniq-proc.json")
-}
-
-fn read_config() -> Config {
-    let config_path = get_config_path();
-    if config_path.exists() {
-        let config_content = fs::read_to_string(config_path).unwrap();
-        from_str(&config_content).unwrap()
-    } else {
-        Config {
-            commands: HashMap::new(),
-        }
+impl DaemonState {
+    fn get_config_path() -> PathBuf {
+        let base_dirs = BaseDirectories::with_prefix("uniq-proc").unwrap();
+        base_dirs.place_config_file("config.json").unwrap()
     }
-}
-
-fn write_config(config: &Config) {
-    let config_path = get_config_path();
-    let config_content = to_string_pretty(config).unwrap();
-    let mut file = File::create(config_path).unwrap();
-    file.write_all(config_content.as_bytes()).unwrap();
-}
-
-fn read_process_map() -> ProcessMap {
-    let process_map_path = get_process_map_path();
-    if process_map_path.exists() {
-        let process_map_content = fs::read_to_string(process_map_path).unwrap();
-        from_str(&process_map_content).unwrap()
-    } else {
-        ProcessMap {
-            processes: HashMap::new(),
-        }
+    pub fn write_commands_to_config_dir(&self) {
+        let config_path = Self::get_config_path();
+        let config_content = serde_json::to_string_pretty(&self.commands).expect("can create json");
+        std::fs::write(config_path, config_content).expect("can write config file");
     }
-}
 
-fn write_process_map(process_map: &ProcessMap) {
-    let process_map_path = get_process_map_path();
-    let process_map_content = to_string_pretty(process_map).unwrap();
-    let mut file = File::create(process_map_path).unwrap();
-    file.write_all(process_map_content.as_bytes()).unwrap();
-}
-
-fn add_command(name: &str, command: &str) {
-    let mut config = read_config();
-    config
-        .commands
-        .insert(name.to_string(), command.to_string());
-    write_config(&config);
-}
-
-fn remove_command(name: &str) {
-    let mut config = read_config();
-    config.commands.remove(name);
-    write_config(&config);
-}
-
-fn execute_command(name: &str) {
-    let config = read_config();
-    if let Some(command) = config.commands.get(name) {
-        let mut process = Command::new("sh").arg("-c").arg(command).spawn().unwrap();
-        let pid = process.id();
-
-        let mut process_map = read_process_map();
-        process_map.processes.insert(name.to_string(), pid);
-        write_process_map(&process_map);
-
-        let _ = process.wait();
-
-        let mut process_map = read_process_map();
-        if let Some(&terminated_pid) = process_map.processes.get(name) {
-            if terminated_pid == pid {
-                process_map.processes.remove(&name.to_string());
-                write_process_map(&process_map);
+    pub fn new() -> Self {
+        let config_path = Self::get_config_path();
+        if config_path.exists() {
+            let config_content = fs::read_to_string(config_path).unwrap();
+            DaemonState {
+                commands: from_str(&config_content).unwrap(),
+                ..Default::default()
+            }
+        } else {
+            DaemonState {
+                ..Default::default()
             }
         }
-    } else {
-        eprintln!("Command not found for name: {}", name);
+    }
+}
+impl Daemon {
+    pub fn execute(&self, name: String) -> String {
+        let command;
+        {
+            let data = self.data.lock().expect("working mutex");
+            let is_running = data.procs.get(&name).is_some();
+            command = if !is_running {
+                data.commands.get(&name).cloned()
+            } else {
+                None
+            };
+        }
+        let Some(command) = command else {
+            return format!("{name} is not registered yet");
+        };
+        let mut process = Command::new("sh").arg("-c").arg(command).spawn().unwrap();
+        let pid = process.id();
+        {
+            let mut data = self.data.lock().expect("no poisioed lock");
+            data.procs.insert(name.clone(), pid);
+        }
+        let _ = process.wait();
+        {
+            let mut data = self.data.lock().expect("working mutex");
+            if data.procs.get(&name).filter(|&id| *id == pid).is_some() {
+                data.procs.remove(&name);
+                format!("{name} executed successfully")
+            } else {
+                format!(
+                    "{name} executed successfully, but was restarted with very interesting timing"
+                )
+            }
+        }
+    }
+
+    pub fn kill(&self, name: String) -> String {
+        let mut data = self.data.lock().expect("working mutex");
+
+        let Some(&pid) = data.procs.get(&name) else {
+            return format!("{name} was not running via uniq-proc");
+        };
+        let mut system = System::new();
+        system.refresh_processes();
+        let Some(process) = system.process((pid as i32).into()) else {
+            return format!("Failed to get the process");
+        };
+        process.kill();
+        data.procs.remove(&name);
+        format!("Successfully killed name")
+    }
+    pub fn toggle(&self, name: String) -> String {
+        let is_running = {
+            let l = self.data.lock().expect("no poisoned lock");
+            l.procs.get(&name).is_some()
+        };
+        if is_running {
+            self.kill(name)
+        } else {
+            self.execute(name)
+        }
+    }
+
+    pub fn add(&self, name: String, command: String) -> String {
+        let mut data = self.data.lock().expect("no poisioed lock");
+        data.commands.insert(name.clone(), command);
+        data.write_commands_to_config_dir();
+        format!("Added: {}", data.commands.get(&name).unwrap())
+    }
+
+    pub fn remove(&self, name: String) -> String {
+        let mut data = self.data.lock().expect("no poisioed lock");
+        data.commands.remove(&name);
+        data.write_commands_to_config_dir();
+        format!("Removed {name}")
+    }
+
+    pub fn restart(&self, name: String) -> String {
+        format!("{}\n{}", self.kill(name.clone()), self.execute(name))
     }
 }
 
-fn kill_process(name: &str) {
-    let mut process_map = read_process_map();
-    if let Some(&pid) = process_map.processes.get(name) {
-        let mut system = System::new();
-        system.refresh_processes();
-        if let Some(process) = system.process((pid as i32).into()) {
-            process.kill();
-            process_map.processes.remove(name);
-            write_process_map(&process_map);
-        } else {
-            eprintln!("Process not found for pid: {}", pid);
+fn send_message(msg: Message) {
+    match std::os::unix::net::UnixStream::connect("/tmp/uniq-proc.sock") {
+        Ok(mut stream) => {
+            let message = serde_json::to_string(&msg).expect("can convert to json");
+            let _ = stream.write_all(&message.bytes().collect::<Vec<_>>());
+
+            let mut response = String::new();
+            match stream.read_to_string(&mut response) {
+                Ok(_) => println!("{response}"),
+                Err(e) => println!("An error has occured while getting the response: {e}"),
+            };
         }
-    } else {
-        eprintln!("No process running for name: {}", name);
+        Err(e) => println!("{e:?}"),
     }
 }
 
@@ -149,21 +290,12 @@ fn main() {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Add { name, command } => add_command(name, command),
-        Commands::Remove { name } => remove_command(name),
-        Commands::Execute { name } => execute_command(name),
-        Commands::Kill { name } => kill_process(name),
-        Commands::Restart { name } => {
-            kill_process(name);
-            execute_command(name);
+        Commands::Daemon { force: f } => {
+            let daemon = Daemon::new(*f);
+            daemon.run();
         }
-        Commands::Toggle { name } => {
-            let process_map = read_process_map();
-            if process_map.processes.get(&name.to_string()).is_some() {
-                kill_process(name);
-            } else {
-                execute_command(name);
-            }
-        }
+        _ => send_message(
+            Message::try_from(cli.command).expect("can convert all that is not Commands::Daemon"),
+        ),
     }
 }
