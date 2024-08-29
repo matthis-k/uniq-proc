@@ -296,13 +296,13 @@ fn main() {
             daemon.run();
         }
         _ => {
-            if cli.autostart && !PathBuf::from("/tmp/uniq-proc.sock").exists() {
+            if cli.autostart && !PathBuf::from("/tmp/uniq-proc.sock").exists() || cli.force {
                 println!(
                     "{}",
                     std::env::current_exe()
                         .expect("can get own executable")
                         .to_str()
-                        .expect("it owrks")
+                        .expect("it works")
                 );
                 let mut cmd = std::process::Command::new(
                     std::env::current_exe().expect("can get own executable"),
