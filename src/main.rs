@@ -20,10 +20,12 @@ use xdg::BaseDirectories;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
-    #[arg(short, default_value_t = false, help = "force a new instance")]
-    force: bool,
-    #[arg(short, default_value_t = true, help = "automatically create a daemon")]
-    autostart: bool,
+    #[arg(
+        short,
+        default_value_t = false,
+        help = "Continue from last daemon state"
+    )]
+    keep: bool,
 }
 
 #[derive(Subcommand)]
@@ -54,6 +56,8 @@ enum Message {
     Remove { name: String },
     /// Lists all commands
     List,
+    /// Check if daemon is running
+    Alive,
     /// Executes a command
     Execute { name: String },
     /// Kills a process
@@ -84,14 +88,12 @@ impl TryFrom<Commands> for Message {
 #[derive(Default)]
 struct Daemon {
     data: Arc<Mutex<DaemonState>>,
-    force: bool,
 }
 
 impl Daemon {
-    pub fn new(force: bool) -> Self {
+    pub fn new(keep: bool) -> Self {
         Self {
-            data: Arc::from(Mutex::from(DaemonState::new())),
-            force,
+            data: Arc::from(Mutex::from(DaemonState::new(keep))),
         }
     }
 
@@ -100,11 +102,13 @@ impl Daemon {
         serde_json::to_string(&data.commands).expect("can convert to json")
     }
 }
+
 impl Daemon {
     pub fn run(&self) {
-        if self.force {
-            let _ = std::fs::remove_file(SOCKET_PATH);
+        if send_message(Message::Alive) == "running" {
+            return;
         }
+        let _ = std::fs::remove_file(SOCKET_PATH);
         let running = Arc::from(AtomicBool::new(true));
         let running_clone = running.clone();
         const SOCKET_PATH: &str = "/tmp/uniq-proc.sock";
@@ -124,7 +128,7 @@ impl Daemon {
             .expect("successfull creation of socket");
         socket
             .set_nonblocking(true)
-            .expect("can set socket to nnblocking");
+            .expect("can set socket to nonblocking");
         std::thread::scope(|s| {
             while running.load(std::sync::atomic::Ordering::SeqCst) {
                 let connection = socket.accept();
@@ -145,6 +149,7 @@ impl Daemon {
                                 Ok(Message::Toggle { name }) => self.toggle(name),
                                 Ok(Message::Execute { name }) => self.execute(name),
                                 Ok(Message::List) => self.list(),
+                                Ok(Message::Alive) => String::from("running"),
                                 Err(_) => String::from("Could parse the command"),
                             };
                             stream.write_all(&response.bytes().collect::<Vec<_>>())
@@ -154,6 +159,7 @@ impl Daemon {
                 }
             }
         });
+        self.data.lock().expect("working mutex").save_state();
         std::fs::remove_file(SOCKET_PATH).expect("can remove socket");
     }
 }
@@ -169,27 +175,41 @@ impl DaemonState {
         let base_dirs = BaseDirectories::with_prefix("uniq-proc").unwrap();
         base_dirs.place_config_file("config.json").unwrap()
     }
+    fn get_state_path() -> PathBuf {
+        PathBuf::from("/tmp/uniq-proc.state")
+    }
     pub fn write_commands_to_config_dir(&self) {
         let config_path = Self::get_config_path();
         let config_content = serde_json::to_string_pretty(&self.commands).expect("can create json");
         std::fs::write(config_path, config_content).expect("can write config file");
     }
 
-    pub fn new() -> Self {
+    pub fn save_state(&self) {
+        let state_path = Self::get_state_path();
+        let state_content = serde_json::to_string_pretty(&self).expect("can create json");
+        std::fs::write(state_path, state_content).expect("can write config file");
+    }
+
+    pub fn new(keep: bool) -> Self {
         let config_path = Self::get_config_path();
+        let last_state_path = Self::get_state_path();
+        let mut result = Self::default();
+        if keep && last_state_path.exists() {
+            let state_content = fs::read_to_string(last_state_path).unwrap();
+            let parsed = from_str::<Self>(&state_content).expect("valid json");
+            if !config_path.exists() {
+                result.commands = parsed.commands;
+            }
+            result.procs = parsed.procs;
+        }
         if config_path.exists() {
             let config_content = fs::read_to_string(config_path).unwrap();
-            DaemonState {
-                commands: from_str(&config_content).unwrap(),
-                ..Default::default()
-            }
-        } else {
-            DaemonState {
-                ..Default::default()
-            }
+            result.commands = from_str(&config_content).expect("valid json");
         }
+        result
     }
 }
+
 impl Daemon {
     pub fn execute(&self, name: String) -> String {
         let command;
@@ -210,12 +230,14 @@ impl Daemon {
         {
             let mut data = self.data.lock().expect("no poisioed lock");
             data.procs.insert(name.clone(), pid);
+            data.save_state();
         }
         let _ = process.wait();
         {
             let mut data = self.data.lock().expect("working mutex");
             if data.procs.get(&name).filter(|&id| *id == pid).is_some() {
                 data.procs.remove(&name);
+                data.save_state();
                 format!("{name} executed successfully")
             } else {
                 format!(
@@ -238,6 +260,7 @@ impl Daemon {
         };
         process.kill();
         data.procs.remove(&name);
+        data.save_state();
         format!("Successfully killed name")
     }
     pub fn toggle(&self, name: String) -> String {
@@ -255,6 +278,7 @@ impl Daemon {
     pub fn add(&self, name: String, command: String) -> String {
         let mut data = self.data.lock().expect("no poisioed lock");
         data.commands.insert(name.clone(), command);
+        data.save_state();
         data.write_commands_to_config_dir();
         format!("Added: {}", data.commands.get(&name).unwrap())
     }
@@ -262,6 +286,7 @@ impl Daemon {
     pub fn remove(&self, name: String) -> String {
         let mut data = self.data.lock().expect("no poisioed lock");
         data.commands.remove(&name);
+        data.save_state();
         data.write_commands_to_config_dir();
         format!("Removed {name}")
     }
@@ -271,19 +296,27 @@ impl Daemon {
     }
 }
 
-fn send_message(msg: Message) {
+fn send_message(msg: Message) -> String {
     match std::os::unix::net::UnixStream::connect("/tmp/uniq-proc.sock") {
         Ok(mut stream) => {
             let message = serde_json::to_string(&msg).expect("can convert to json");
-            let _ = stream.write_all(&message.bytes().collect::<Vec<_>>());
+            stream
+                .write_all(&message.bytes().collect::<Vec<_>>())
+                .expect("can write to stream");
+            stream
+                .set_write_timeout(std::time::Duration::from_millis(160).into())
+                .expect("can set read timeout");
 
             let mut response = String::new();
             match stream.read_to_string(&mut response) {
-                Ok(_) => println!("{response}"),
-                Err(e) => println!("An error has occured while getting the response: {e}"),
-            };
+                Ok(_) => format!("{response}"),
+                Err(e) => match msg {
+                    Message::Alive => format!("not running"),
+                    _ => format!("An error has occured while getting the response: {e}"),
+                },
+            }
         }
-        Err(e) => println!("{e:?}"),
+        Err(e) => format!("{e:?}"),
     }
 }
 
@@ -292,23 +325,16 @@ fn main() {
 
     match &cli.command {
         Commands::Daemon => {
-            let daemon = Daemon::new(cli.force);
+            let daemon = Daemon::new(cli.keep);
             daemon.run();
         }
         _ => {
-            if cli.autostart && !PathBuf::from("/tmp/uniq-proc.sock").exists() || cli.force {
-                println!(
-                    "{}",
-                    std::env::current_exe()
-                        .expect("can get own executable")
-                        .to_str()
-                        .expect("it works")
-                );
+            if send_message(Message::Alive) != "running" {
                 let mut cmd = std::process::Command::new(
                     std::env::current_exe().expect("can get own executable"),
                 );
-                if cli.force {
-                    cmd.arg("-f");
+                if cli.keep {
+                    cmd.arg("-k");
                 }
                 cmd.arg("daemon");
                 cmd.spawn().expect("can start command");
@@ -317,10 +343,12 @@ fn main() {
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
             }
-            send_message(
+
+            let response = send_message(
                 Message::try_from(cli.command)
                     .expect("can convert all that is not Commands::Daemon"),
             );
+            println!("{response}");
         }
     }
 }
